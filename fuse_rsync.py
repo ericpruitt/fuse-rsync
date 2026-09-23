@@ -25,6 +25,7 @@ class RsyncModule():
     """
     def __init__(self, host, module, user=None, password=None):
         self._environment = os.environ.copy()
+        self._environment["TZ"] = "Etc/UTC"
         self._remote_url = "rsync://"
         if user is not None:
             self._remote_url += user + "@"
@@ -80,14 +81,14 @@ class RsyncModule():
 
                 try:
                     size = int(size_str.replace(',', ''))
-                    timestamp = datetime.datetime.strptime(
-                        f"{date_str} {time_str}", "%Y/%m/%d %H:%M:%S"
+                    dt = datetime.datetime.strptime(
+                        f"{date_str} {time_str} +0000", "%Y/%m/%d %H:%M:%S %z"
                     )
 
                     listing.append({
                         "attrs": self._parse_attrs(attrs),
                         "size": size,
-                        "timestamp": timestamp,
+                        "timestamp": dt.timestamp(),
                         "filename": filename
                     })
                 except (ValueError, AssertionError):
@@ -188,8 +189,8 @@ class FuseRsync(fuse.Fuse):
                 info = listing[0]
                 self._attr_cache[path] = info
 
-            timestamp = (info["timestamp"] - datetime.datetime(1970, 1, 1)).total_seconds()
-            st.st_atime = timestamp
+            timestamp = info["timestamp"]
+            st.st_atime = timestamp  # TODO: consider maintaining in-memory atimes.
             st.st_ctime = timestamp
             st.st_uid = os.geteuid()
             st.st_gid = os.getegid()
