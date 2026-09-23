@@ -3,6 +3,8 @@
 # Copyright (c) 2014 Jonas Zaddach
 # Licensed under the MIT License (https://github.com/zaddach/fuse-rsync/blob/master/LICENSE)
 
+import collections
+import threading
 import os
 import sys
 import errno
@@ -14,16 +16,80 @@ import time
 import re
 import fuse
 from tempfile import mkstemp
-from threading import Lock
 
 fuse.fuse_python_api = (0, 2)
 log = logging.getLogger('fuse_rsync')
+
+EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR = 23
+
+
+class TTLLRUMapping:
+    """
+    A class for defining a mapping with a finite number of members that have a
+    user-defined validity period.
+    """
+    _sentinel = object()
+
+    def __init__(self, ttl, maxsize=128, *, data=None):
+        """
+        Arguments:
+        - ttl: Lifetime in seconds of mapping members.
+        - maxsize: The maximum number of values the mapping can hold before the
+          oldest items are evicted.
+        - data: The initial set of members of the mapping. This can be any
+          value accepted by the `dict` built-in.
+        """
+        self._dict = collections.OrderedDict(data or ())
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._lock = threading.RLock()
+
+        if data:
+            for key, value in dict(data).items():
+                self.set(key, value)
+
+    def get(self, key, default=_sentinel):
+        try:
+            with self._lock:
+                value, expiration = self._dict.pop(key)
+
+                if time.monotonic() >= expiration:
+                    raise KeyError
+
+                now = time.monotonic()
+                self._dict[key] = (value, now + self._ttl)
+                return value
+        except KeyError:
+            if default is not self._sentinel:
+                return default
+
+        raise KeyError(key)
+
+    def set(self, key, value):
+        with self._lock:
+            now = time.monotonic()
+
+            try:
+                self._dict.pop(key)
+            except KeyError:
+                if len(self._dict) >= self._maxsize:
+                    # While eliminating entries to reduce the amount of values
+                    # stored, we also prune any expired values even if it's not
+                    # necessary to get the dictionary below capacity.
+                    while self._dict:
+                        _, expiration = self._cache.popitem(last=False)
+
+                        if now < expiration:
+                            break
+
+            self._dict[key] = (value, now + self._ttl)
+
 
 class RsyncModule():
     """
         This class implements access to an Rsync module.
     """
-    def __init__(self, host, module, user=None, password=None):
+    def __init__(self, host, module, user=None, password=None, cache_ttl=300, cache_size=4096):
         self._environment = os.environ.copy()
         self._environment["TZ"] = "Etc/UTC"
         self._remote_url = "rsync://"
@@ -34,7 +100,7 @@ class RsyncModule():
 
         if password is not None:
             self._environment['RSYNC_PASSWORD'] = password
-        self._attr_cache = {}
+        self._attr_cache = TTLLRUMapping(ttl=cache_ttl, maxsize=cache_size)
 
     def _parse_attrs(self, attrs):
         """
@@ -62,7 +128,7 @@ class RsyncModule():
 
         return result
 
-    def list(self, path='/'):
+    def list(self, path):
         """
             List files contained in directory __path__.
             Returns a list of dictionaries with keys *attrs* (numerical attribute
@@ -70,38 +136,53 @@ class RsyncModule():
             in a datetime object) and *filename* (The file's name).
         """
         remote_url = self._remote_url + path
-        try:
+        isdir = path.endswith("/")
+        listing = self._attr_cache.get(remote_url, [])
+
+        if not listing:
             cmdline = ["rsync", "--list-only", remote_url]
             log.debug("executing %s", " ".join(cmdline))
-            output = subprocess.check_output(cmdline, env=self._environment, text=True)
 
-            listing = []
+            try:
+                output = subprocess.check_output(
+                    cmdline, env=self._environment, text=True
+                )
+            except subprocess.CalledProcessError as err:
+                if err.returncode != EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR:
+                    raise err
+
+                return listing
+
+            if isdir:
+                self._attr_cache.set(remote_url, listing)
+
             for line in output.splitlines():
-                attrs, size_str, date_str, time_str, filename = line.split(None, 4)
-
                 try:
+                    attrs, size_str, date, time, filename = line.split(None, 4)
+
                     size = int(size_str.replace(',', ''))
                     dt = datetime.datetime.strptime(
-                        f"{date_str} {time_str} +0000", "%Y/%m/%d %H:%M:%S %z"
+                        f"{date} {time} +0000", "%Y/%m/%d %H:%M:%S %z"
                     )
 
-                    listing.append({
+                    entry = {
                         "attrs": self._parse_attrs(attrs),
                         "size": size,
                         "timestamp": dt.timestamp(),
                         "filename": filename
-                    })
-                except (ValueError, AssertionError):
+                    }
+                except ValueError:
                     log.warn("Unable to parse line: %r", line)
                     continue
 
-            return listing
-        except subprocess.CalledProcessError as err:
-            if err.returncode == 23:
-                return []
-            raise err
+                listing.append(entry)
+                self._attr_cache.set(
+                    remote_url + filename if isdir else remote_url, entry
+                )
 
-    def copy(self, remotepath='/', localpath=None):
+        return listing
+
+    def copy(self, remotepath, localpath=None):
         """
             Copy a file from the remote rsync module to the local filesystem.
             If no local destination is specified in __localpath__, a temporary
@@ -140,7 +221,7 @@ class FuseRsync(fuse.Fuse):
 
         self._attr_cache = {}
         self._file_cache = {}
-        self._file_cache_lock = Lock()
+        self._file_cache_lock = threading.Lock()
 
         super().__init__(*args, **kw)
 
@@ -149,6 +230,18 @@ class FuseRsync(fuse.Fuse):
         self.parser.add_option(mountopt='host', type=str, help="Rsync remote host")
         self.parser.add_option(mountopt='module', type=str, help="Rsync module on remote host")
         self.parser.add_option(mountopt='path', type=str, default="/", help="Rsync path in module on remote host that is supposed to be the root point")
+
+        self.parser.add_option("-t", "--cache-ttl",
+            default=300,
+            type="int",
+            help="number of seconds file metadata is cached in memory"
+        )
+        self.parser.add_option("-c", "--cache-size",
+            default=300,
+            type="int",
+            help="maximum number of file metadata entries cached in memory"
+        )
+
 
     def _full_path(self, partial):
         if partial.startswith("/"):
@@ -159,7 +252,14 @@ class FuseRsync(fuse.Fuse):
     def init(self):
         options = self.cmdline[0]
         log.debug("Invoked fsinit() with host=%s, module=%s, user=%s, password=%s", options.host, options.module, options.user, options.password)
-        self._rsync = RsyncModule(options.host, options.module, options.user, options.password)
+        self._rsync = RsyncModule(
+            host=options.host,
+            module=options.module,
+            user=options.user,
+            password=options.password,
+            cache_ttl=options.cache_ttl,
+            cache_size=options.cache_size,
+        )
 
     def getattr(self, path, fh=None):
         try:
