@@ -22,6 +22,7 @@ log = logging.getLogger('fuse_rsync')
 
 EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR = 23
 
+FILE_MODE_RE = re.compile("^.([-r][-w][-xsS]){2}([-r][-w][-xtT])$", re.ASCII)
 
 class TTLLRUMapping:
     """
@@ -102,31 +103,56 @@ class RsyncModule():
             self._environment['RSYNC_PASSWORD'] = password
         self._attr_cache = TTLLRUMapping(ttl=cache_ttl, maxsize=cache_size)
 
-    def _parse_attrs(self, attrs):
+    def _text_to_mode(self, attrs):
         """
-            Parse the textual representation of file attributes to binary representation.
+        Convert textural representation of a file's mode to its numeric
+        representation.
+
+        Arguments:
+        - attrs: String containing the file type and permissions. The format
+          rsync uses is the same as `ls -l`.
+
+        Return: A numeric value representing the reconstructed st_mode.
         """
-        result = 0
+        if not FILE_MODE_RE.match(attrs):
+            log.error("Unsupported permission/mode string: %r", attrs)
+            return 0
+
         if attrs[0] == 'd':
-            result |= stat.S_IFDIR
+            mode = stat.S_IFDIR
         elif attrs[0] == 'l':
-            result |= stat.S_IFLNK
+            mode = stat.S_IFLNK
         elif attrs[0] == '-':
-            result |= stat.S_IFREG
+            mode = stat.S_IFREG
         else:
-           assert False
+            mode = 0
+            log.error("Unable to determine file type from %r", attrs)
 
-        for i in range(0, 3):
+        for i in range(3):
             val = 0
-            if 'r' in attrs[1 + 3 * i: 4 + 3 * i]:
-                val |= 4
-            if 'w' in attrs[1 + 3 * i: 4 + 3 * i]:
-                val |= 2
-            if 'x' in attrs[1 + 3 * i: 4 + 3 * i]:
-                val |= 1
-            result |= val << ((2 - i) * 3)
+            perms = attrs[1 + 3 * i: 4 + 3 * i]
 
-        return result
+            if "r" in perms:
+                val |= 4
+
+            if "w" in perms:
+                val |= 2
+
+            if "x" in perms or "s" in perms or "t" in perms:
+                val |= 1
+
+            if "s" in perms or "S" in perms:
+                if i == 0:  # User
+                    mode |= stat.S_ISUID
+                elif i == 1:  # Group
+                    mode |= stat.S_ISGID
+            elif "t" in perms or "T" in perms:
+                if i == 2:  # Other
+                    mode |= stat.S_ISVTX
+
+            mode |= val << ((2 - i) * 3)
+
+        return mode
 
     def list(self, path):
         """
@@ -166,7 +192,7 @@ class RsyncModule():
                     )
 
                     entry = {
-                        "attrs": self._parse_attrs(attrs),
+                        "st_mode": self._text_to_mode(attrs),
                         "size": size,
                         "timestamp": dt.timestamp(),
                         "filename": filename
@@ -294,7 +320,7 @@ class FuseRsync(fuse.Fuse):
             st.st_ctime = timestamp
             st.st_uid = os.geteuid()
             st.st_gid = os.getegid()
-            if info["attrs"] & stat.S_IFDIR:
+            if info["st_mode"] & stat.S_IFDIR:
                 st.st_mode  = stat.S_IFDIR | 0o555
             else:
                 st.st_mode = stat.S_IFREG | 0o444
