@@ -499,7 +499,7 @@ class FuseRsync(fuse.Fuse):
         minimum_size_required = length + offset
         process, localfile = self._file_cache[path]["proc_file"]
 
-        while process.returncode is None:
+        while process.poll() is None:
             try:
                 st = os.fstat(fh.handle)
             except Exception:
@@ -511,7 +511,7 @@ class FuseRsync(fuse.Fuse):
 
             time.sleep(0.100)
 
-        if process.returncode:
+        if process.poll():
             log.error("%s: rsync returned code %s", path, process.returncode)
 
             # Even if rsync failed, we will only report a problem if the user
