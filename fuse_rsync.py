@@ -86,22 +86,48 @@ class TTLLRUMapping:
             self._dict[key] = (value, now + self._ttl)
 
 
-class RsyncModule():
+class FuseRsyncFileInfo(fuse.FuseFileInfo):
     """
-        This class implements access to an Rsync module.
+        Encapsulates the file handle for an opened file.
     """
-    def __init__(self, host, module, user=None, password=None, cache_ttl=300, cache_size=4096):
-        self._environment = os.environ.copy()
-        self._environment["TZ"] = "Etc/UTC"
-        self._remote_url = "rsync://"
-        if user is not None:
-            self._remote_url += user + "@"
+    def __init__(self, handle, **kw):
+        super().__init__(**kw)
+        self.keep = True
+        self.handle = handle
 
-        self._remote_url += host + "/" + module
 
-        if password is not None:
-            self._environment['RSYNC_PASSWORD'] = password
-        self._attr_cache = TTLLRUMapping(ttl=cache_ttl, maxsize=cache_size)
+class FuseRsync(fuse.Fuse):
+    """
+        The implementation of the FUSE filesystem.
+    """
+    def __init__(self, *args, **kw):
+        self.host = None
+        self.module = None
+        self.user = None
+        self.password = None
+        self.path = "/"
+
+        self._file_cache = {}
+        self._file_cache_lock = threading.Lock()
+
+        super().__init__(*args, **kw)
+
+        self.parser.add_option(mountopt='user', default=None, help="Rsync user on the remote host")
+        self.parser.add_option(mountopt='password', type=str, default=None, help="Rsync password on the remote host")
+        self.parser.add_option(mountopt='host', type=str, help="Rsync remote host")
+        self.parser.add_option(mountopt='module', type=str, help="Rsync module on remote host")
+        self.parser.add_option(mountopt='path', type=str, default="/", help="Rsync path in module on remote host that is supposed to be the root point")
+
+        self.parser.add_option("-t", "--cache-ttl",
+            default=300,
+            type="int",
+            help="number of seconds file metadata is cached in memory"
+        )
+        self.parser.add_option("-c", "--cache-size",
+            default=300,
+            type="int",
+            help="maximum number of file metadata entries cached in memory"
+        )
 
     def _text_to_mode(self, attrs):
         """
@@ -203,10 +229,15 @@ class RsyncModule():
 
                 listing.append(entry)
                 self._attr_cache.set(
-                    remote_url + filename if isdir else remote_url, entry
+                    remote_url + filename if isdir else remote_url, [entry]
                 )
 
-        return listing
+        if isdir:
+            return listing
+        elif len(listing) == 1:
+            return listing[0]
+        else:
+            return None
 
     def copy(self, remotepath, localpath=None):
         """
@@ -225,49 +256,6 @@ class RsyncModule():
 
         return localpath
 
-class FuseRsyncFileInfo(fuse.FuseFileInfo):
-    """
-        Encapsulates the file handle for an opened file.
-    """
-    def __init__(self, handle, **kw):
-        super().__init__(**kw)
-        self.keep = True
-        self.handle = handle
-
-class FuseRsync(fuse.Fuse):
-    """
-        The implementation of the FUSE filesystem.
-    """
-    def __init__(self, *args, **kw):
-        self.host = None
-        self.module = None
-        self.user = None
-        self.password = None
-        self.path = "/"
-
-        self._attr_cache = {}
-        self._file_cache = {}
-        self._file_cache_lock = threading.Lock()
-
-        super().__init__(*args, **kw)
-
-        self.parser.add_option(mountopt='user', default=None, help="Rsync user on the remote host")
-        self.parser.add_option(mountopt='password', type=str, default=None, help="Rsync password on the remote host")
-        self.parser.add_option(mountopt='host', type=str, help="Rsync remote host")
-        self.parser.add_option(mountopt='module', type=str, help="Rsync module on remote host")
-        self.parser.add_option(mountopt='path', type=str, default="/", help="Rsync path in module on remote host that is supposed to be the root point")
-
-        self.parser.add_option("-t", "--cache-ttl",
-            default=300,
-            type="int",
-            help="number of seconds file metadata is cached in memory"
-        )
-        self.parser.add_option("-c", "--cache-size",
-            default=300,
-            type="int",
-            help="maximum number of file metadata entries cached in memory"
-        )
-
 
     def _full_path(self, partial):
         if partial.startswith("/"):
@@ -278,14 +266,19 @@ class FuseRsync(fuse.Fuse):
     def init(self):
         options = self.cmdline[0]
         log.debug("Invoked fsinit() with host=%s, module=%s, user=%s, password=%s", options.host, options.module, options.user, options.password)
-        self._rsync = RsyncModule(
-            host=options.host,
-            module=options.module,
-            user=options.user,
-            password=options.password,
-            cache_ttl=options.cache_ttl,
-            cache_size=options.cache_size,
-        )
+
+        self._environment = os.environ.copy()
+        self._environment["TZ"] = "Etc/UTC"
+        self._remote_url = "rsync://"
+        if options.user:
+            self._remote_url += options.user + "@"
+
+        self._remote_url += options.host + "/" + options.module
+
+        if options.password:
+            self._environment['RSYNC_PASSWORD'] = options.password
+        self._attr_cache = TTLLRUMapping(ttl=options.cache_ttl, maxsize=options.cache_size)
+
 
     def getattr(self, path, fh=None):
         try:
@@ -305,15 +298,11 @@ class FuseRsync(fuse.Fuse):
                 st.st_gid = os.getegid()
                 return st
 
-            if path in self._attr_cache:
-                info = self._attr_cache[path]
-            else:
-                listing = self._rsync.list(path)
-                if len(listing) != 1:
-                    log.warning("Found none or several files for path")
-                    return -errno.ENOENT
-                info = listing[0]
-                self._attr_cache[path] = info
+            info = self.list(path)
+
+            if not info:
+                log.warning("%s: file not found or rsync return invalid output", path)
+                return -errno.ENOENT
 
             timestamp = info["timestamp"]
             st.st_atime = timestamp  # TODO: consider maintaining in-memory atimes.
@@ -344,10 +333,9 @@ class FuseRsync(fuse.Fuse):
             yield fuse.Direntry('.')
             yield fuse.Direntry('..')
 
-            for dirent in self._rsync.list(full_path):
+            for dirent in self.list(full_path):
                 if dirent["filename"] == ".":
                     continue
-                self._attr_cache[path + dirent["filename"]] = dirent
                 yield fuse.Direntry(str(dirent["filename"]))
         except Exception:
             log.exception("While doing readdir")
@@ -361,7 +349,7 @@ class FuseRsync(fuse.Fuse):
 
         with self._file_cache_lock:
             if path not in self._file_cache:
-                localfile = self._rsync.copy(full_path)
+                localfile = self.copy(full_path)
                 self._file_cache[path] = {"refcount": 1, "localpath": localfile}
             else:
                 self._file_cache[path]["refcount"] += 1
