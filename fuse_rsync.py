@@ -210,11 +210,6 @@ class FuseRsync(fuse.Fuse):
                 print(error, file=sys.stderr)
                 return EXIT_BAD_USAGE
 
-            self.host = None
-            self.module = None
-            self.user = None
-            self.password = None
-
             self._file_cache = {}
             self._file_cache_lock = threading.Lock()
 
