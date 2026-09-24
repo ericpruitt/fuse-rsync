@@ -232,7 +232,7 @@ class FuseRsync(fuse.Fuse):
 
         return listing
 
-    def copy(self, remotepath, localpath=None):
+    def copy(self, remotepath):
         """
             Copy a file from the remote rsync module to the local filesystem.
             If no local destination is specified in __localpath__, a temporary
@@ -240,14 +240,13 @@ class FuseRsync(fuse.Fuse):
             to be deleted by the caller.
         """
         remote_url = self._remote_url + remotepath
-        if localpath is None:
-            fd, localpath = mkstemp()
-            os.close(fd)
-        cmdline = ["rsync", "--copy-links", remote_url, localpath]
-        log.debug("executing %s", " ".join(cmdline))
-        subprocess.check_call(cmdline, env=self._environment)
+        fd, localpath = mkstemp()
+        os.close(fd)
 
-        return localpath
+        argv = ["rsync", "--copy-links", "--inplace", remote_url, localpath]
+        log.critical("executing %s", " ".join(argv))
+        process = subprocess.Popen(argv, env=self._environment)
+        return (process, localpath)
 
 
     def _full_path(self, partial):
@@ -328,39 +327,75 @@ class FuseRsync(fuse.Fuse):
                 yield fuse.Direntry(dirent["filename"])
 
     def open(self, path, flags):
-        log.debug("invoking open(%s, %d)", path, flags)
+        log.debug("open(%r, %d)", path, flags)
 
-        full_path = self._full_path(path)
         if (flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)) != os.O_RDONLY:
             return -errno.EACCES
 
+        full_path = self._full_path(path)
+
         with self._file_cache_lock:
-            if path not in self._file_cache:
-                localfile = self.copy(full_path)
-                self._file_cache[path] = {"refcount": 1, "localpath": localfile}
-            else:
+            if path in self._file_cache:
                 self._file_cache[path]["refcount"] += 1
-                localfile = self._file_cache[path]["localpath"]
+                _, localfile = self._file_cache[path]["proc_file"]
+            else:
+                proc_file = _, localfile = self.copy(full_path)
+                self._file_cache[path] = {
+                    "refcount": 1,
+                    "proc_file": proc_file,
+                }
 
         handle = os.open(localfile, os.O_RDONLY)
         log.debug("Created file handle %d", handle)
         return FuseRsyncFileInfo(handle)
 
     def read(self, path, length, offset, fh):
-        log.debug("invoking read(%s, %d, %d, %d)", path, length, offset, fh.handle)
+        log.critical("read(%r, %d, %d, %d)", path, length, offset, fh.handle)
+        minimum_size_required = length + offset
+        process, localfile = self._file_cache[path]["proc_file"]
+
+        while process.returncode is None:
+            try:
+                st = os.fstat(fh.handle)
+            except Exception:
+                log.exception("os.fstat(%r (%r))", fh.handle, localfile)
+                return -errno.EIO
+
+            if st.st_size >= minimum_size_required:
+                break
+
+            time.sleep(0.100)
+
+        if process.returncode:
+            log.error("%s: non-zero rsync exit code %s", path, process.returncode)
+
+            # Even if rsync failed, we will only report a problem if the user
+            # is trying to read past any data that was already downloaded.
+            st = os.fstat(fh.handle)
+
+            if st.st_size < minimum_size_required:
+                return -errno.EIO
+
         os.lseek(fh.handle, offset, os.SEEK_SET)
         return os.read(fh.handle, length)
 
     def release(self, path, dummy, fh):
-        log.debug("invoking release(%s, %d, %d)", path, dummy, fh.handle)
+        log.debug("release(%r, %d, %d)", path, dummy, fh.handle)
         os.close(fh.handle)
 
         with self._file_cache_lock:
             self._file_cache[path]["refcount"] -= 1
             if self._file_cache[path]["refcount"] <= 0:
-                localfile = self._file_cache[path]["localpath"]
+                process, localfile = self._file_cache[path]["proc_file"]
                 del self._file_cache[path]
                 os.unlink(localfile)
+
+                # It's important that we use terminate here because rsync may
+                # fork into multiple processes, and using kill will result in
+                # the children lingering.
+                process.terminate()
+                process.wait()
+
 
 if __name__ == '__main__':
     fs = FuseRsync()
