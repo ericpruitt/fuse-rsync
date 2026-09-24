@@ -216,21 +216,19 @@ class FuseRsync(fuse.Fuse):
                     dt = datetime.datetime.strptime(
                         f"{date} {time} +0000", "%Y/%m/%d %H:%M:%S %z"
                     )
-
+                except ValueError:
+                    log.warn("Unable to parse line: %r", line)
+                else:
                     entry = {
                         "st_mode": self._text_to_mode(attrs),
                         "size": size,
                         "timestamp": dt.timestamp(),
                         "filename": filename
                     }
-                except ValueError:
-                    log.warn("Unable to parse line: %r", line)
-                    continue
-
-                listing.append(entry)
-                self._attr_cache.set(
-                    remote_url + filename if isdir else remote_url, [entry]
-                )
+                    listing.append(entry)
+                    self._attr_cache.set(
+                        remote_url + filename if isdir else remote_url, [entry]
+                    )
 
         return listing
 
