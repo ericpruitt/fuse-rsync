@@ -78,7 +78,7 @@ class TTLLRUMapping:
                     # stored, we also prune any expired values even if it's not
                     # necessary to get the dictionary below capacity.
                     while self._dict:
-                        _, expiration = self._cache.popitem(last=False)
+                        _, expiration = self._dict.popitem(last=False)
 
                         if now < expiration:
                             break
