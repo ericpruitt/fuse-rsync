@@ -232,12 +232,7 @@ class FuseRsync(fuse.Fuse):
                     remote_url + filename if isdir else remote_url, [entry]
                 )
 
-        if isdir:
-            return listing
-        elif len(listing) == 1:
-            return listing[0]
-        else:
-            return None
+        return listing
 
     def copy(self, remotepath, localpath=None):
         """
@@ -279,66 +274,60 @@ class FuseRsync(fuse.Fuse):
             self._environment['RSYNC_PASSWORD'] = options.password
         self._attr_cache = TTLLRUMapping(ttl=options.cache_ttl, maxsize=options.cache_size)
 
-
     def getattr(self, path, fh=None):
+        log.debug("getattr(%r)", path)
+        path = self._full_path(path)
+
         try:
-            log.debug("Invoked getattr('%s')", path)
-
-            path = self._full_path(path)
-
-            st = fuse.Stat()
-
-            if path == "/":
-                st.st_atime = int(time.time())
-                st.st_ctime = int(time.time())
-                st.st_mode  = stat.S_IFDIR | 0o555
-                st.st_mtime = int(time.time())
-                st.st_nlink = 2
-                st.st_uid = os.geteuid()
-                st.st_gid = os.getegid()
-                return st
-
-            info = self.list(path)
-
-            if not info:
-                log.warning("%s: file not found or rsync return invalid output", path)
-                return -errno.ENOENT
-
-            timestamp = info["timestamp"]
-            st.st_atime = timestamp  # TODO: consider maintaining in-memory atimes.
-            st.st_ctime = timestamp
-            st.st_uid = os.geteuid()
-            st.st_gid = os.getegid()
-            if info["st_mode"] & stat.S_IFDIR:
-                st.st_mode  = stat.S_IFDIR | 0o555
-            else:
-                st.st_mode = stat.S_IFREG | 0o444
-            st.st_mtime = timestamp
-            st.st_nlink = 1
-            st.st_size = info["size"]
-
-            return st
+            listing = self.list(path)
         except Exception:
-            log.exception("while doing getattr")
+            log.expcetion("list(%r): exception raised", path)
+            return -errno.EIO
+
+        if not listing:
+            log.warning("%s: file not found or rsync return invalid output", path)
             return -errno.ENOENT
 
+        if path.endswith("/"):
+            listing = [x for x in listing if x["filename"] == "."]
+
+        if len(listing) == 0:
+            return -errno.ENOENT
+        elif len(listing) > 1:
+            return -errno.EIO
+
+        metadata = listing[0]
+        timestamp = metadata["timestamp"]
+
+        st = fuse.Stat()
+        st.st_atime = timestamp  # TODO: consider maintaining in-memory atimes.
+        st.st_ctime = timestamp
+        st.st_mtime = timestamp
+
+        st.st_uid = os.geteuid()
+        st.st_gid = os.getegid()
+
+        st.st_nlink = 2 if path.endswith("/") else 1
+        st.st_size = metadata["size"]
+        st.st_mode = 0o777 & metadata["st_mode"]
+
+        if metadata["st_mode"] & stat.S_IFDIR:
+            st.st_mode |= stat.S_IFDIR
+        else:
+            st.st_mode |= stat.S_IFREG
+
+        return st
+
     def readdir(self, path, offset):
-        try:
-            if not path.endswith("/"):
-                path += "/"
-            log.debug("Invoked readdir('%s')", path)
+        yield fuse.Direntry('.')
+        yield fuse.Direntry('..')
 
-            full_path = self._full_path(path)
+        if not path.endswith("/"):
+            path += "/"
 
-            yield fuse.Direntry('.')
-            yield fuse.Direntry('..')
-
-            for dirent in self.list(full_path):
-                if dirent["filename"] == ".":
-                    continue
-                yield fuse.Direntry(str(dirent["filename"]))
-        except Exception:
-            log.exception("While doing readdir")
+        for dirent in self.list(self._full_path(path)):
+            if dirent["filename"] != ".":
+                yield fuse.Direntry(dirent["filename"])
 
     def open(self, path, flags):
         log.debug("invoking open(%s, %d)", path, flags)
