@@ -57,7 +57,7 @@ class TTLLRUMapping:
 
         Arguments:
         - key: Mapping key.
-        - default: The default value return if the key is not in the mapping.
+        - default: The default value returned if the key is not in the mapping.
 
         Raises:
         - KeyError: No default value was specified, and the key does not exist
@@ -358,7 +358,7 @@ class FuseRsync(fuse.Fuse):
         try:
             listing = self.list(path)
         except Exception:
-            log.expcetion("list(%r): exception raised", path)
+            log.exception("list(%r): exception raised", path)
             return -errno.EIO
 
         if not listing:
@@ -425,16 +425,16 @@ class FuseRsync(fuse.Fuse):
         - path: Path of the file in FUSE filesystem.
         - flags: Flags that determine the behavior of the file. Only flags that
           determine if the file is readable and/or writeable are used, and a
-          flags that requests write access will result in this function
+          flag that requests write access will result in this function
           returning `-errno.EACCES` since the FUSE filesystem is read-only.
 
-        Return: None if the operating succeeds. If the operation fails,
+        Return: None if the operation succeeds. If the operation fails,
         `-errno.EIO` or `-errno.ENOENT` is returned.
         """
         log.debug("open(%r, 0x%x)", path, flags)
 
         if (flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)) != os.O_RDONLY:
-            log.debug("open(%r, 0x%x) -> EACCESS", path, flags)
+            log.debug("open(%r, 0x%x) -> EACCES", path, flags)
             return -errno.EACCES
 
         with self._file_cache_lock:
@@ -457,7 +457,7 @@ class FuseRsync(fuse.Fuse):
         Read data from the specified file.
 
         - path: Path of the file in FUSE filesystem.
-        - size: The maximum number of bytes to read.
+        - length: The maximum number of bytes to read.
         - offset: The offset within the file from which the read should begin.
         - fh: FUSE file handle for the opened file.
 
@@ -546,7 +546,7 @@ def rsync_unescape(text):
 
 def text_to_mode(attrs):
     """
-    Convert textural representation of a file's mode to its numeric
+    Convert textual representation of a file's mode to its numeric
     representation.
 
     Arguments:
