@@ -289,7 +289,7 @@ class FuseRsync(fuse.Fuse):
 
             try:
                 output = subprocess.check_output(
-                    cmdline, env=self._environment, text=True
+                    cmdline, env=self._environment, errors="surrogateescape"
                 )
             except subprocess.CalledProcessError as err:
                 if err.returncode != RSYNC_EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR:
