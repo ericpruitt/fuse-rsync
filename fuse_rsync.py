@@ -20,6 +20,7 @@ log = logging.getLogger("fuse_rsync")
 RSYNC_EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR = 23
 
 FILE_MODE_RE = re.compile("^.([-r][-w][-xsS]){2}([-r][-w][-xtT])$", re.ASCII)
+RSYNC_ESCAPE_RE = re.compile(br"\\#([0-3][0-7][0-7])", re.ASCII)
 
 EXIT_BAD_USAGE = 2
 
@@ -215,7 +216,7 @@ class FuseRsync(fuse.Fuse):
 
             self._environment = os.environ.copy()
             self._environment["TZ"] = "Etc/UTC"
-            self._environment["LC_ALL"] = "C.UTF-8"
+            self._environment["LC_ALL"] = "C"
 
             self._remote_url = "rsync://"
 
@@ -325,7 +326,7 @@ class FuseRsync(fuse.Fuse):
         listing = self._attr_cache.get(remote_url, [])
 
         if not listing:
-            cmdline = ["rsync", "--list-only", remote_url]
+            cmdline = ["rsync", "--8-bit-output", "--list-only", remote_url]
             log.debug("executing %s", " ".join(cmdline))
 
             try:
@@ -344,6 +345,7 @@ class FuseRsync(fuse.Fuse):
             for line in output.splitlines():
                 try:
                     attrs, size_str, date, time, filename = line.split(None, 4)
+                    filename = rsync_unescape(filename)
 
                     size = int(size_str.replace(',', ''))
                     dt = datetime.datetime.strptime(
@@ -564,6 +566,25 @@ class FuseRsync(fuse.Fuse):
                 # the children lingering.
                 process.terminate()
                 process.wait()
+
+
+def rsync_unescape(text):
+    """
+    Translate any rsync escape sequences in the text.
+
+    Arguments:
+    - text: Text containing rsync escape sequences.
+
+    Return: Unescaped/canonical text.
+    """
+    if "\\#" in text:
+        data = text.encode("UTF-8", "surrogateescape")
+        unescaped_data = RSYNC_ESCAPE_RE.sub(
+            lambda x: bytes([int(x.group(1), 8)]), data
+        )
+        text = unescaped_data.decode("UTF-8", "surrogateescape")
+
+    return text
 
 
 if __name__ == '__main__':
