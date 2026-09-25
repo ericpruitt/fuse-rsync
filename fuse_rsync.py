@@ -161,13 +161,13 @@ class FuseRsync(fuse.Fuse):
             help="Path under the module that acts as the mountpoint root"
         )
         self.parser.add_option(
-            "-t", "--cache-ttl",
+            "-t", "--metadata-cache-ttl",
             default=300,
             type="int",
             help="Number of seconds file metadata is cached in memory"
         )
         self.parser.add_option(
-            "-c", "--cache-size",
+            "-c", "--metadata-cache-size",
             default=8192,
             type="int",
             help="Maximum number of file metadata entries cached in memory"
@@ -191,9 +191,9 @@ class FuseRsync(fuse.Fuse):
                 error = "Too many non-option arguments"
             elif not parameters:
                 error = "Mountpoint not specified"
-            elif options.cache_size < 0:
+            elif options.metadata_cache_ttl < 0:
                 error = "Cache TTL must be at least 0"
-            elif options.cache_size < 1:
+            elif options.metadata_cache_size < 1:
                 error = "Cache size must be greater than or equal to 1"
             else:
                 error = None
@@ -245,7 +245,8 @@ class FuseRsync(fuse.Fuse):
                 return error.returncode
 
             self._attr_cache = TTLLRUMapping(
-                ttl=options.cache_ttl, maxsize=options.cache_size
+                ttl=options.metadata_cache_ttl,
+                maxsize=options.metadata_cache_size,
             )
 
         super().main()
