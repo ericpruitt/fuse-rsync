@@ -259,57 +259,6 @@ class FuseRsync(fuse.Fuse):
 
         super().main()
 
-    def _text_to_mode(self, attrs):
-        """
-        Convert textural representation of a file's mode to its numeric
-        representation.
-
-        Arguments:
-        - attrs: String containing the file type and permissions. The format
-          rsync uses is the same as `ls -l`.
-
-        Return: A numeric value representing the reconstructed st_mode.
-        """
-        if not FILE_MODE_RE.match(attrs):
-            log.error("Unsupported permission/mode string: %r", attrs)
-            return 0
-
-        if attrs[0] == 'd':
-            mode = stat.S_IFDIR
-        elif attrs[0] == 'l':
-            mode = stat.S_IFLNK
-        elif attrs[0] == '-':
-            mode = stat.S_IFREG
-        else:
-            mode = 0
-            log.error("Unable to determine file type from %r", attrs)
-
-        for i in range(3):
-            val = 0
-            perms = attrs[1 + 3 * i: 4 + 3 * i]
-
-            if "r" in perms:
-                val |= 4
-
-            if "w" in perms:
-                val |= 2
-
-            if "x" in perms or "s" in perms or "t" in perms:
-                val |= 1
-
-            if "s" in perms or "S" in perms:
-                if i == 0:  # User
-                    mode |= stat.S_ISUID
-                elif i == 1:  # Group
-                    mode |= stat.S_ISGID
-            elif "t" in perms or "T" in perms:
-                if i == 2:  # Other
-                    mode |= stat.S_ISVTX
-
-            mode |= val << ((2 - i) * 3)
-
-        return mode
-
     def list(self, path):
         """
         Get metadata for the specified path. If the path ends with a "/", it is
@@ -364,7 +313,7 @@ class FuseRsync(fuse.Fuse):
                     log.warn("Unable to parse line: %r", line)
                 else:
                     entry = {
-                        "st_mode": self._text_to_mode(attrs),
+                        "st_mode": text_to_mode(attrs),
                         "size": size,
                         "timestamp": dt.timestamp(),
                         "filename": filename
@@ -593,6 +542,58 @@ def rsync_unescape(text):
         text = unescaped_data.decode("UTF-8", "surrogateescape")
 
     return text
+
+
+def text_to_mode(attrs):
+    """
+    Convert textural representation of a file's mode to its numeric
+    representation.
+
+    Arguments:
+    - attrs: String containing the file type and permissions. The format
+      rsync uses is the same as `ls -l`.
+
+    Return: A numeric value representing the reconstructed st_mode.
+    """
+    if not FILE_MODE_RE.match(attrs):
+        log.error("Unsupported permission/mode string: %r", attrs)
+        return 0
+
+    if attrs[0] == 'd':
+        mode = stat.S_IFDIR
+    elif attrs[0] == 'l':
+        mode = stat.S_IFLNK
+    elif attrs[0] == '-':
+        mode = stat.S_IFREG
+    else:
+        mode = 0
+        log.error("Unable to determine file type from %r", attrs)
+
+    for i in range(3):
+        val = 0
+        perms = attrs[1 + 3 * i: 4 + 3 * i]
+
+        if "r" in perms:
+            val |= 4
+
+        if "w" in perms:
+            val |= 2
+
+        if "x" in perms or "s" in perms or "t" in perms:
+            val |= 1
+
+        if "s" in perms or "S" in perms:
+            if i == 0:  # User
+                mode |= stat.S_ISUID
+            elif i == 1:  # Group
+                mode |= stat.S_ISGID
+        elif "t" in perms or "T" in perms:
+            if i == 2:  # Other
+                mode |= stat.S_ISVTX
+
+        mode |= val << ((2 - i) * 3)
+
+    return mode
 
 
 if __name__ == '__main__':
