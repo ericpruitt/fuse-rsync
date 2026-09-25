@@ -224,8 +224,24 @@ class FuseRsync(fuse.Fuse):
 
             self._remote_url += options.host + "/" + options.module
 
+            if options.path:
+                options.path = "/" + options.path.lstrip("/")
+                self._remote_url = os.path.join(
+                    self._remote_url, os.path.relpath(options.path, "/")
+                )
+
             if options.password:
                 self._environment['RSYNC_PASSWORD'] = options.password
+
+            try:
+                # Perform a smoke test to verify that the remote URL is valid.
+                subprocess.check_call(
+                    ["rsync", "--list-only", self._remote_url],
+                    env=self._environment,
+                    stdout=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError as error:
+                return error.returncode
 
             self._attr_cache = TTLLRUMapping(
                 ttl=options.cache_ttl, maxsize=options.cache_size
