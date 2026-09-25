@@ -534,8 +534,7 @@ class FuseRsync(fuse.Fuse):
             if st.st_size < minimum_size_required:
                 return -errno.EIO
 
-        os.lseek(fh.handle, offset, os.SEEK_SET)
-        return os.read(fh.handle, length)
+        return os.pread(fh.handle, length, offset)
 
     def release(self, path, flags, fh):
         """
