@@ -19,6 +19,8 @@ log = logging.getLogger("fuse_rsync")
 
 RSYNC_EXIT_PARTIAL_TRANSFER_DUE_TO_ERROR = 23
 
+SUPPORTED_ST_MODE_MASK = 0o777 | stat.S_IFLNK | stat.S_IFDIR | stat.S_IFREG
+
 FILE_MODE_RE = re.compile("^.([-r][-w][-xsS]){2}([-r][-w][-xtT])$", re.ASCII)
 RSYNC_ESCAPE_RE = re.compile(br"\\#([0-3][0-7][0-7])", re.ASCII)
 
@@ -37,7 +39,8 @@ class TTLLRUMapping:
         Arguments:
         - ttl: Lifetime in seconds of mapping members.
         - maxsize: The maximum number of values the mapping can hold before the
-          oldest items are evicted.
+          oldest items are evicted. If this value is 0 or None, the size is
+          unbounded.
         - data: The initial set of members of the mapping. This can be any
           value accepted by the `dict` built-in.
         """
@@ -45,10 +48,35 @@ class TTLLRUMapping:
         self._maxsize = maxsize
         self._ttl = ttl
         self._lock = threading.RLock()
+        self._next_eviction_check = time.monotonic() + self._ttl
 
         if data:
             for key, value in dict(data).items():
                 self.set(key, value)
+
+    def _perform_ttl_evictions(self):
+        """
+        Evict keys whose TTLs have expired. Concurrent calls are rate-limited
+        so the function is called no more than once per TTL period. This
+        function must be called with the object lock already acquired.
+        """
+        now = time.monotonic()
+
+        if now < self._next_eviction_check:
+            return
+        else:
+            self._next_eviction_check = now + self._ttl
+
+        expired_keys = set()
+
+        for key, (_, expiration) in self._dict.items():
+            if now < expiration:
+                break
+
+            expired_keys.add(key)
+
+        for key in expired_keys:
+            self._dict.pop(key)
 
     def get(self, key, default=_sentinel):
         """
@@ -67,6 +95,11 @@ class TTLLRUMapping:
         """
         try:
             with self._lock:
+                # If a max size is defined, TTL evictions are handled by the
+                # "set" method.
+                if not self._maxsize:
+                    self._perform_ttl_evictions()
+
                 value, expiration = self._dict.pop(key)
 
                 if time.monotonic() >= expiration:
@@ -95,7 +128,7 @@ class TTLLRUMapping:
             try:
                 self._dict.pop(key)
             except KeyError:
-                if len(self._dict) >= self._maxsize:
+                if self._maxsize and len(self._dict) >= self._maxsize:
                     # While eliminating entries to reduce the amount of values
                     # stored, we also prune any expired values even if it's not
                     # necessary to get the dictionary below capacity.
@@ -252,6 +285,15 @@ class FuseRsync(fuse.Fuse):
             except subprocess.CalledProcessError as error:
                 return error.returncode
 
+            self._readlink_path_locks = collections.defaultdict(threading.Lock)
+            self._readlink_path_locks_lock = threading.RLock()
+
+            self._readlink_cache_lock = threading.Lock()
+            self._readlink_cache = TTLLRUMapping(
+                ttl=options.metadata_cache_ttl,
+                maxsize=None,
+            )
+
             self._attr_cache = TTLLRUMapping(
                 ttl=options.metadata_cache_ttl,
                 maxsize=options.metadata_cache_size,
@@ -325,7 +367,7 @@ class FuseRsync(fuse.Fuse):
 
         return listing
 
-    def fetch(self, remotepath):
+    def fetch(self, remotepath, *, check_call=False):
         """
         Launch an rsync process to copy a remote file to the local system. The
         download is done in a non-blocking manner, and the returned subprocess
@@ -338,10 +380,58 @@ class FuseRsync(fuse.Fuse):
         fd, localpath = tempfile.mkstemp()
         os.close(fd)
 
-        argv = [self.rsync, "--copy-links", "--inplace", remote_url, localpath]
+        argv = [self.rsync, "--links", "--inplace", remote_url, localpath]
         log.critical("executing %s", " ".join(argv))
         process = subprocess.Popen(argv, env=self._environment)
+
+        if check_call and process.wait():
+            raise subprocess.CalledProcessError(argv, subprocess.returncode)
+
         return (process, localpath)
+
+    def readlink(self, path):
+        """
+        Get the destination of a symbolic link.
+
+        Arguments:
+        - path: Path of the symbolic link.
+
+        Return: If the operation succeeds, the destination of the symbolic link
+        is returned. Otherwise, a negated errno value is returned.
+        """
+        log.critical("readlink(%r)", path)
+
+        while True:
+            with self._readlink_cache_lock:
+                destination = self._readlink_cache.get(path, None)
+
+            if destination is None:
+                with self._readlink_path_locks_lock:
+                    lock = self._readlink_path_locks[path]
+
+                acquired = lock.acquire(False)
+
+                # Another thread is already fetching this file, so we wait on
+                # it to finish then try to retrieve it from the readlink cache
+                # again.
+                if not acquired:
+                    lock.acquire()
+                    lock.release()
+                    continue
+
+                try:
+                    _, localpath = self.fetch(path, check_call=True)
+                    destination = os.readlink(localpath)
+                    self._readlink_cache.set(path, destination)
+                    os.unlink(localpath)
+                except Exception as error:
+                    log.exception("readlink(%r)", path)
+                    destination = -getattr(error, "errno", errno.EIO)
+                finally:
+                    lock.release()
+
+            log.debug("readlink(%r) -> %r", path, destination)
+            return destination
 
     def getattr(self, path, fh=None):
         """
@@ -376,7 +466,7 @@ class FuseRsync(fuse.Fuse):
         metadata = listing[0]
         timestamp = metadata["timestamp"]
 
-        st = fuse.Stat(
+        return fuse.Stat(
             st_atime=timestamp,  # TODO: consider maintaining in-memory atimes.
             st_ctime=timestamp,
             st_mtime=timestamp,
@@ -384,15 +474,8 @@ class FuseRsync(fuse.Fuse):
             st_gid=os.getegid(),
             st_nlink=2 if path.endswith("/") else 1,
             st_size=metadata["size"],
-            st_mode=0o777 & metadata["st_mode"],
+            st_mode=metadata["st_mode"] & SUPPORTED_ST_MODE_MASK,
         )
-
-        if metadata["st_mode"] & stat.S_IFDIR:
-            st.st_mode |= stat.S_IFDIR
-        else:
-            st.st_mode |= stat.S_IFREG
-
-        return st
 
     def readdir(self, path, offset):
         """
