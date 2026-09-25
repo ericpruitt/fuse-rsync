@@ -172,6 +172,12 @@ class FuseRsync(fuse.Fuse):
             type="int",
             help="Maximum number of file metadata entries cached in memory"
         )
+        self.parser.add_option(
+            "-e", "--rsync",
+            default="rsync",
+            type="str",
+            help="Path or name of the rsync executable"
+        )
 
         try:
             super().parse(argv)
@@ -211,6 +217,8 @@ class FuseRsync(fuse.Fuse):
                 print(error, file=sys.stderr)
                 return EXIT_BAD_USAGE
 
+            self.rsync = options.rsync
+
             self._file_cache = {}
             self._file_cache_lock = threading.Lock()
 
@@ -237,7 +245,7 @@ class FuseRsync(fuse.Fuse):
             try:
                 # Perform a smoke test to verify that the remote URL is valid.
                 subprocess.check_call(
-                    ["rsync", "--list-only", self._remote_url],
+                    [self.rsync, "--list-only", self._remote_url],
                     env=self._environment,
                     stdout=subprocess.DEVNULL,
                 )
@@ -327,7 +335,7 @@ class FuseRsync(fuse.Fuse):
         listing = self._attr_cache.get(remote_url, [])
 
         if not listing:
-            cmdline = ["rsync", "--8-bit-output", "--list-only", remote_url]
+            cmdline = [self.rsync, "--8-bit-output", "--list-only", remote_url]
             log.debug("executing %s", " ".join(cmdline))
 
             try:
@@ -381,7 +389,7 @@ class FuseRsync(fuse.Fuse):
         fd, localpath = tempfile.mkstemp()
         os.close(fd)
 
-        argv = ["rsync", "--copy-links", "--inplace", remote_url, localpath]
+        argv = [self.rsync, "--copy-links", "--inplace", remote_url, localpath]
         log.critical("executing %s", " ".join(argv))
         process = subprocess.Popen(argv, env=self._environment)
         return (process, localpath)
